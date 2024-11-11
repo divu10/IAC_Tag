@@ -1,81 +1,96 @@
 import boto3
 
 def lambda_handler(event, context):
-    # Initialize EFS client
-    efs_client = boto3.client('efs')
-
-    print(f"Received event: {event}")
+    # Initialize the S3 client inside the handler function
+    s3_client = boto3.client('s3')
+    
+    # Log the entire incoming event
+    print(f"Received event: {event}")  
 
     try:
-        # Handle two possible structures: with or without 'detail'
-        event_detail = event.get('detail', event)
+        # Check if 'detail' is in the event
+        if 'detail' not in event:
+            print("Missing 'detail' in event")  # Log missing detail
+            return {"statusCode": 400, "body": "Missing 'detail' in event"}
+
+        # Capture event name from the nested 'detail' key
+        event_name = event['detail'].get('eventName')
+        print(f"Event name: {event_name}")  # Log the event name
         
-        # Capture event name
-        event_name = event_detail.get('eventName')
-        if not event_name:
-            print("Event name not found in event")
-            return {"statusCode": 400, "body": "Event name not found"}
+        if 'userIdentity' in event['detail']:
+            user_identity = event['detail']['userIdentity']['type']
+            role_arn = event['detail']['userIdentity']['arn']
+            if user_identity == "AssumedRole" and "autotag" in role_arn and event_name == "PutBucketTagging":
+                print("Event triggered by Lambda itself; skipping to avoid loop.")
+                return {"statusCode": 200, "body": "Ignored event to prevent infinite loop"}
 
-        print(f"Event name: {event_name}")
-
-        # Avoid infinite loop
-        user_identity = event_detail.get('userIdentity', {})
-        if user_identity.get('type') == "AssumedRole" and "autotag" in user_identity.get('arn', '') and event_name == "TagResource":
-            print("Event triggered by Lambda itself; skipping to avoid loop.")
-            return {"statusCode": 200, "body": "Ignored event to prevent infinite loop"}
-
-        # Handle specific events
-        if event_name not in ['TagResource', 'UntagResource']:
-            print(f"Unsupported event: {event_name}")
+        # Handle only specific events
+        if event_name not in ['PutBucketTagging', 'DeleteBucketTagging']:
+            print(f"Unsupported event: {event_name}")  # Log unsupported event
             return {"statusCode": 400, "body": f"Unsupported event: {event_name}"}
 
-        # Retrieve ResourceId
-        resource_id = event_detail.get("requestParameters", {}).get("resourceId")
-        if not resource_id:
-            print("ResourceId not found in the event")
-            return {"statusCode": 400, "body": "ResourceId not found in the event"}
+        # Extract bucket name from the 'requestParameters' key within 'detail'
+        bucket_name = event["detail"]["requestParameters"].get("bucketName")
+        print(f"Bucket name: {bucket_name}")  # Log the bucket name
 
-        print(f"ResourceId: {resource_id}")
+        # Check if bucket_name was extracted correctly
+        if not bucket_name:
+            print("Bucket name not found in the event")  # Log missing bucket name
+            return {"statusCode": 400, "body": "Bucket name not found in the event"}
 
-        # Get current tags
+        # Retrieve current tags to check if the Lambda has already processed this bucket
         try:
-            current_tags_response = efs_client.describe_tags(FileSystemId=resource_id)
-            current_tags = current_tags_response.get('Tags', [])
-        except efs_client.exceptions.ClientError as e:
-            print(f"Error fetching current tags: {e}")
-            return {"statusCode": 500, "body": str(e)}
+            current_tags_response = s3_client.get_bucket_tagging(Bucket=bucket_name)
+            current_tags = current_tags_response['TagSet']
+        except s3_client.exceptions.ClientError as e:
+            # Handle the case where the bucket has no tags set yet
+            if e.response['Error']['Code'] == 'NoSuchTagSet':
+                current_tags = []
+            else:
+                print(f"Error fetching current tags: {e}")
+                return {"statusCode": 500, "body": str(e)}
 
-        # Define mandatory tags
+        # Check if Lambda has already processed this bucket by looking for 'LambdaProcessed' tag
+        current_tags_set = {tag['Key']: tag['Value'] for tag in current_tags}
+        if current_tags_set.get("LambdaProcessed") == "True":
+            print("Bucket already processed by Lambda, skipping...")
+            return {"statusCode": 200, "body": "Bucket already processed by Lambda"}
+
+        # Define mandatory tags to be applied
         mandatory_tags = [
             {'Key': 'Division', 'Value': 'CD'},
-            {'Key': 'Studio', 'Value': 'Ajax'}
+            {'Key': 'Studio', 'Value': 'Ajax'}  
         ]
 
-        current_tags_set = {tag['Key']: tag['Value'] for tag in current_tags}
-
-        # Handle UntagResource
-        if event_name == 'UntagResource':
-            efs_client.tag_resource(
-                ResourceId=resource_id,
-                Tags=mandatory_tags
+        # Handle DeleteBucketTagging by re-applying the mandatory tags
+        if event_name == 'DeleteBucketTagging':
+            response = s3_client.put_bucket_tagging(
+                Bucket=bucket_name,
+                Tagging={'TagSet': mandatory_tags}
             )
-            print(f"Re-applied tags for {resource_id}")
-            return {"statusCode": 200, "body": f"Tags re-applied for {resource_id}"}
+            print(f"Re-applied tags for {bucket_name}")  # Log the re-application action
+            print(f"Response from put_bucket_tagging: {response}")  # Log the response
 
-        # Handle TagResource
-        elif event_name == 'TagResource':
+        # Handle PutBucketTagging
+        elif event_name == 'PutBucketTagging':
+            # Check for mandatory tags and ensure they are present
             for mandatory_tag in mandatory_tags:
                 if mandatory_tag['Key'] not in current_tags_set:
-                    print(f"Mandatory tag {mandatory_tag['Key']} not found, adding...")
-                    current_tags.append(mandatory_tag)
+                    print(f"Mandatory tag {mandatory_tag['Key']} not found, adding...")  # Log missing tag
+                    current_tags.append(mandatory_tag)  # Add mandatory tag if missing
+                else:
+                    print(f"Mandatory tag {mandatory_tag['Key']} already present.")
 
-            efs_client.tag_resource(
-                ResourceId=resource_id,
-                Tags=current_tags
+            # Re-apply the tags including mandatory ones
+            response = s3_client.put_bucket_tagging(
+                Bucket=bucket_name,
+                Tagging={'TagSet': current_tags}
             )
-            print(f"Tags applied for {resource_id}: {current_tags}")
-            return {"statusCode": 200, "body": f"Tags handled for {resource_id}"}
+            print(f"Tags applied for {bucket_name}: {current_tags}")  # Log the applied tags
+            print(f"Response from put_bucket_tagging: {response}")  # Log the response
 
+        return {"statusCode": 200, "body": f"Tags handled for {bucket_name}"}
+    
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}")  # Log any error encountered
         return {"statusCode": 500, "body": str(e)}
