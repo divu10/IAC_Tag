@@ -1,0 +1,136 @@
+import boto3
+
+# Define mandatory tags
+MANDATORY_TAGS = [
+    {'Key': 'Division', 'Value': 'CD'},
+    {'Key': 'Studio', 'Value': 'Ajax'}
+]
+
+# Initialize AWS clients
+CLIENTS = {
+    'ec2.amazonaws.com': boto3.client('ec2'),
+    'dynamodb.amazonaws.com': boto3.client('dynamodb'),
+    's3.amazonaws.com': boto3.client('s3'),
+    'elasticfilesystem.amazonaws.com': boto3.client('efs')
+}
+
+def lambda_handler(event, context):
+    print(f"Received event: {event}")
+    
+    try:
+        # Extract event details
+        event_detail = event.get('detail', event)
+        event_source = event_detail.get('eventSource')
+        event_name = event_detail.get('eventName')
+
+        # Validate event structure
+        if not event_source or not event_name:
+            return {"statusCode": 400, "body": "Invalid event structure"}
+
+        print(f"Event source: {event_source}, Event name: {event_name}")
+
+        # Avoid infinite loops for Lambda-triggered events
+        if _is_lambda_triggered(event_detail):
+            print("Skipping event triggered by Lambda")
+            return {"statusCode": 200, "body": "Event ignored to prevent loops"}
+
+        # Get the appropriate client and handler
+        client = CLIENTS.get(event_source)
+        handler = HANDLERS.get(event_source)
+        
+        if not client or not handler:
+            print(f"Unsupported event source: {event_source}")
+            return {"statusCode": 400, "body": f"Unsupported event source: {event_source}"}
+
+        # Call the handler dynamically
+        return handler(event_detail, client, MANDATORY_TAGS)
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return {"statusCode": 500, "body": str(e)}
+
+def _is_lambda_triggered(event_detail):
+    """Check if the event was triggered by the Lambda itself."""
+    user_identity = event_detail.get('userIdentity', {})
+    return user_identity.get('type') == "AssumedRole" and "autotag" in user_identity.get('arn', '')
+
+def handle_ec2_event(event_detail, ec2_client, mandatory_tags):
+    resource_id = _get_resource_id(event_detail, "ec2")
+    if not resource_id:
+        return {"statusCode": 400, "body": "Resource ID not found for EC2"}
+
+    return _apply_tags(ec2_client.create_tags, Resources=[resource_id], Tags=mandatory_tags, resource_id=resource_id)
+
+def handle_dynamodb_event(event_detail, dynamodb_client, mandatory_tags):
+    resource_arn = event_detail.get("requestParameters", {}).get("resourceArn")
+    if not resource_arn:
+        return {"statusCode": 400, "body": "ResourceArn not found for DynamoDB"}
+
+    return _apply_tags(dynamodb_client.tag_resource, ResourceArn=resource_arn, Tags=mandatory_tags, resource_id=resource_arn)
+
+def handle_s3_event(event_detail, s3_client, mandatory_tags):
+    bucket_name = event_detail.get("requestParameters", {}).get("bucketName")
+    if not bucket_name:
+        return {"statusCode": 400, "body": "Bucket name not found for S3"}
+
+    return _handle_s3_tags(s3_client, bucket_name, mandatory_tags)
+
+def handle_efs_event(event_detail, efs_client, mandatory_tags):
+    resource_id = event_detail.get("requestParameters", {}).get("resourceId")
+    if not resource_id:
+        return {"statusCode": 400, "body": "ResourceId not found for EFS"}
+
+    return _apply_tags(efs_client.tag_resource, ResourceId=resource_id, Tags=mandatory_tags, resource_id=resource_id)
+
+def _get_resource_id(event_detail, resource_type):
+    """Extract resource ID based on the resource type."""
+    if resource_type == "ec2":
+        items = event_detail.get("requestParameters", {}).get("resourcesSet", {}).get("items", [])
+        return items[0]["resourceId"] if items and "resourceId" in items[0] else None
+    return None
+
+def _apply_tags(apply_method, **kwargs):
+    """Apply tags to a resource and handle exceptions."""
+    resource_id = kwargs.pop("resource_id", "unknown")
+    try:
+        apply_method(**kwargs)
+        print(f"Tags applied to {resource_id}: {kwargs.get('Tags')}")
+        return {"statusCode": 200, "body": f"Tags handled for {resource_id}"}
+    except Exception as e:
+        print(f"Error applying tags to {resource_id}: {e}")
+        return {"statusCode": 500, "body": str(e)}
+
+def _handle_s3_tags(s3_client, bucket_name, mandatory_tags):
+    """Fetch, merge, and apply tags for S3 buckets."""
+    try:
+        current_tags_response = s3_client.get_bucket_tagging(Bucket=bucket_name)
+        current_tags = current_tags_response.get('TagSet', [])
+    except s3_client.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchTagSet':
+            current_tags = []
+        else:
+            print(f"Error fetching tags for bucket {bucket_name}: {e}")
+            return {"statusCode": 500, "body": str(e)}
+
+    valid_tags = [tag for tag in current_tags if not tag['Key'].startswith('aws:')]
+    current_tags_set = {tag['Key']: tag['Value'] for tag in valid_tags}
+    
+    for mandatory_tag in mandatory_tags:
+        if mandatory_tag['Key'] not in current_tags_set:
+            valid_tags.append(mandatory_tag)
+
+    try:
+        s3_client.put_bucket_tagging(Bucket=bucket_name, Tagging={'TagSet': valid_tags})
+        print(f"Tags applied to bucket {bucket_name}: {valid_tags}")
+        return {"statusCode": 200, "body": f"Tags handled for bucket {bucket_name}"}
+    except Exception as e:
+        print(f"Error applying tags to bucket {bucket_name}: {e}")
+        return {"statusCode": 500, "body": str(e)}
+
+# Map event sources to handler functions
+HANDLERS = {
+    'ec2.amazonaws.com': handle_ec2_event,
+    'dynamodb.amazonaws.com': handle_dynamodb_event,
+    's3.amazonaws.com': handle_s3_event,
+    'elasticfilesystem.amazonaws.com': handle_efs_event
+}
